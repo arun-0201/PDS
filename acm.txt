@@ -1,0 +1,916 @@
+DotProduct.cu
+
+#include <stdio.h>
+#include <sys/time.h>
+
+__device__ double cpusecond() {
+    struct timeval tp;
+    gettimeofday(&tp, NULL);
+    return tp.tv_sec + tp.tv_usec * 1e-6;
+}
+
+__global__ void dotProduct(int *a, int *b, int *res, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] *= b[i];
+    __syncthreads();
+    for (int s = 1; s < n; s *= 2) {
+        __syncthreads();
+        if (i % (2 * s) == 0 && i + s < n) a[i] += a[i + s];
+    }
+    if (i == 0) *res = a[0];
+}
+
+int main() {
+    const int N = 5;
+    int ha[N] = {1,2,3,4,5}, hb[N] = {10,20,30,40,50}, hres = 0;
+    int *da, *db, *dres;
+
+    cudaMalloc(&da, N * sizeof(int));
+    cudaMalloc(&db, N * sizeof(int));
+    cudaMalloc(&dres, sizeof(int));
+    cudaMemcpy(da, ha, N * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(db, hb, N * sizeof(int), cudaMemcpyHostToDevice);
+
+    double start = cpusecond();
+    dotProduct<<<1, N>>>(da, db, dres, N);
+    cudaDeviceSynchronize();
+    double end = cpusecond();
+
+    cudaMemcpy(&hres, dres, sizeof(int), cudaMemcpyDeviceToHost);
+    printf("Dot product: %d\nTime: %f sec\n", hres, end - start);
+
+    cudaFree(da); cudaFree(db); cudaFree(dres);
+}
+-------------------------------------------------------------------
+MatrixTransposeCuda.cu
+
+#include <stdio.h>
+#include <cuda.h>
+#define N 3
+#define M 3
+
+__global__ void transpose(float *in, float *out) {
+    __shared__ float tile[N][M];
+    int x = threadIdx.x, y = threadIdx.y;
+    tile[y][x] = in[y * M + x];
+    __syncthreads();
+    out[x * N + y] = tile[y][x];
+}
+
+int main() {
+    float h_in[N*M] = {1,2,3,4,5,6,7,8,9}, h_out[N*M];
+    float *d_in, *d_out;
+    cudaMalloc(&d_in, N*M*sizeof(float));
+    cudaMalloc(&d_out, N*M*sizeof(float));
+    cudaMemcpy(d_in, h_in, N*M*sizeof(float), cudaMemcpyHostToDevice);
+
+    dim3 block(N, M);
+    transpose<<<1, block>>>(d_in, d_out);
+    cudaMemcpy(h_out, d_out, N*M*sizeof(float), cudaMemcpyDeviceToHost);
+
+    printf("Transposed Matrix:\n");
+    for(int i=0;i<M;i++){
+        for(int j=0;j<N;j++) printf("%.0f ", h_out[i*N+j]);
+        printf("\n");
+    }
+
+    cudaFree(d_in); cudaFree(d_out);
+}
+
+-------------------------------------------------------------------
+
+StencilCuda.cu
+
+#include<stdio.h>
+#include <cuda.h>
+#define N 9
+#define R 2
+__global__ void stencilshared(int *in, int *out, int rows, int radius) {
+    __shared__ int tile[N];
+    int x = threadIdx.x + blockIdx.x * blockDim.x;
+    if (x < rows) {
+        tile[threadIdx.x] = in[x];
+    }
+    __syncthreads();
+    if (x < rows) {
+        int i = threadIdx.x - radius;
+        if (i < 0) {
+                i=0;
+        }
+        int j = threadIdx.x + radius;
+        if (j >= rows) {
+                j = rows - 1;
+        }
+        for (int k=i;k<=j;k++) {
+                out[threadIdx.x] += tile[k];
+        }
+    __syncthreads();
+    }
+}
+int main() {
+    int h_in[N] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    int h_out[N] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int *d_in, *d_out;
+    size_t size = N * sizeof(float);
+    cudaMalloc(&d_in, size);
+    cudaMalloc(&d_out, size);
+    cudaMemcpy(d_in, h_in, size, cudaMemcpyHostToDevice);
+    dim3 dimBlock(N, 1);
+    dim3 dimGrid(1, 1);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+    stencilshared<<<dimGrid, dimBlock>>>(d_in, d_out, N, R);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    cudaMemcpy(h_out, d_out, size, cudaMemcpyDeviceToHost);
+    printf("Original matrix:\n");
+    for (int i = 0; i < N; i++) {
+        printf("%d ", h_in[i]);
+    }
+    printf("\nResult array:\n");
+    for (int i = 0; i < N; i++) {
+        printf("%d ", h_out[i]);
+    }
+    printf("\nExecution time (CUDA): %f ms\n", milliseconds);
+    cudaFree(d_in);
+    cudaFree(d_out);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    return 0;
+}
+
+---------------------------------------------------------------------------------
+#include <stdio.h>
+#include <math.h>
+#include <cuda_runtime.h>
+
+#define N 9
+#define E (2*(N-1))
+
+__global__ void inclusive_scan(int *data, int n) {
+    extern __shared__ int s[];
+    int t = threadIdx.x;
+    if (t < n) {
+        s[t] = data[t];
+    }
+    __syncthreads();
+    for (int offset = 1; offset < n; offset <<= 1) {
+        int add = (t >= offset) ? s[t - offset] : 0;
+        __syncthreads();
+        if (t < n) {
+            s[t] += add;
+        }
+        __syncthreads();
+    }
+    if (t < n) {
+        data[t] = s[t];
+    }
+}
+
+void build_children(const int parent[], int child_count[], int children[][N]) {
+    for (int i = 0; i < N; ++i) {
+        child_count[i] = 0;
+    }
+    for (int v = 0; v < N; ++v) {
+        int p = parent[v];
+        if (p != -1) {
+            children[p][ child_count[p]++ ] = v;
+        }
+    }
+}
+
+void dfs_euler(int u, const int parent[], int child_count[], int children[][N],
+               int edges_u[], int edges_v[], int *pos) {
+    for (int i = 0; i < child_count[u]; ++i) {
+        int v = children[u][i];
+        edges_u[*pos] = u;
+        edges_v[*pos] = v;
+        (*pos)++;
+        dfs_euler(v, parent, child_count, children, edges_u, edges_v, pos);
+        edges_u[*pos] = v;
+        edges_v[*pos] = u;
+        (*pos)++;
+    }
+}
+
+int main() {
+    const char labels[N] = {'a','b','c','d','e','f','g','h','i'};
+    int parent[N] = {-1, 0, 0, 1, 1, 2, 3, 3, 4};
+    int child_count[N];
+    static int children[N][N];
+    build_children(parent, child_count, children);
+    int edges_u[E], edges_v[E];
+    int pos = 0;
+    dfs_euler(0, parent, child_count, children, edges_u, edges_v, &pos);
+    if (pos != E) {
+        fprintf(stderr, "Warning: Euler tour produced %d edges, expected %d\n", pos, E);
+    }
+    int w[E];
+    for (int i = 0; i < E; ++i) {
+        w[i] = (parent[edges_v[i]] == edges_u[i]) ? 1 : 0;
+    }
+    int *d_w;
+    cudaMalloc((void**)&d_w, E * sizeof(int));
+    cudaMemcpy(d_w, w, E * sizeof(int), cudaMemcpyHostToDevice);
+    inclusive_scan<<<1, E, E * sizeof(int)>>>(d_w, E);
+    cudaDeviceSynchronize();
+    int pref[E];
+    cudaMemcpy(pref, d_w, E * sizeof(int), cudaMemcpyDeviceToHost);
+    int preorder[N];
+    int seen[N];
+    for (int i = 0; i < N; ++i) {
+        preorder[i] = 0;
+        seen[i] = 0;
+    }
+    for (int i = 0; i < E; ++i) {
+        if (w[i] == 1) {
+            int node = edges_v[i];
+            if (!seen[node]) {
+                preorder[node] = pref[i] + 1;
+                seen[node] = 1;
+            }
+        }
+    }
+    for (int r = 0; r < N; ++r) {
+        if (parent[r] == -1) {
+            preorder[r] = 1;
+            break;
+        }
+    }
+    printf("\nPreorder numbering:\n");
+    for (int i = 0; i < N; ++i) {
+        printf("%c -> %d\n", labels[i], preorder[i]);
+    }
+    printf("\nPreorder Traversal: ");
+    for (int k = 1; k <= N; ++k) {
+        for (int v = 0; v < N; ++v) {
+            if (preorder[v] == k) {
+                printf("%c ", labels[v]);
+            }
+        }
+    }
+
+    printf("\n");
+    int logN = (int)ceil(log2((double)N));
+    printf("\nTime Complexity : O(log N) = O(%d)\n", logN);
+    printf("Cost Complexity : O(N log N) = O(%d * %d) = O(%d)\n", N, logN, N*logN);
+    cudaFree(d_w);
+    return 0;
+}
+
+
+SampleOutput:
+Preorder numbering:
+a -> 1
+b -> 2
+c -> 8
+d -> 3
+e -> 6
+f -> 9
+g -> 4
+h -> 5
+i -> 7
+
+Preorder Traversal: a b d g h e i c f
+
+Time Complexity : O(log N) = O(4)
+Cost Complexity : O(N log N) = O(9 * 4) = O(36)
+-----------------------------------------------------------------------------------------------
+Source Code:
+
+#include <stdio.h>
+#include<sys/time.h>
+
+__device__ void print_list(int* data) {
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < 64; i++) {
+            printf("%d ", data[i]);
+        }
+        printf("\n\n");
+    }
+}
+
+__device__ void swap(int* a, int* b) {
+    int temp;
+    if (*a > *b) {
+        temp = *a;
+        *a = *b;
+        *b = temp;
+    }
+}
+
+__device__ void sort32(int* data) {
+    for (int i = 0; i < 32; i++) {
+        swap(&data[2 * threadIdx.x], &data[2 * threadIdx.x + 1]);
+        __syncthreads();
+        swap(&data[2 * threadIdx.x + 1], &data[2 * threadIdx.x + 2]);
+        __syncthreads();
+    }
+}
+
+__global__ void testKernel(void) {
+    __shared__ int data[65];
+
+    // Generate some un-sorted data...
+    data[2 * threadIdx.x] = threadIdx.x + 20;
+    data[(2 * threadIdx.x) + 1] = 100 - threadIdx.x;
+    data[64] = 99999; // easier than dealing with edge case
+
+    sort32(data);
+    print_list(data);
+}
+
+int main(void) {
+    cudaEvent_t start , stop ;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+    testKernel<<<1, 32>>>(); // Just 1 warp!
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms = 0 ;
+    cudaEventElapsedTime(&ms , start , stop);
+    printf("Execution Time : %f ms " , ms);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cudaDeviceSynchronize();
+
+    return 0;
+}
+
+Sample Output:
+
+
+20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100
+
+Execution Time : 27.754496 ms
+-----------------------------------------------------------------------------------------------
+
+#include <stdio.h>
+#include <math.h>
+#define N 16
+#define TPB 8
+#define MIN_PART 16
+
+__device__ void insertionSort(int *a, int l, int r) {
+    for (int i = l + 1; i <= r; i++) {
+        int key = a[i], j = i - 1;
+        while (j >= l && a[j] > key) {
+            a[j + 1] = a[j];
+            j--;
+        }
+        a[j + 1] = key;
+    }
+}
+
+__device__ int partition(int *a, int l, int r) {
+    int pivot = a[r], i = l - 1;
+    for (int j = l; j < r; j++) {
+        if (a[j] < pivot) {
+            int t = a[++i];
+            a[i] = a[j];
+            a[j] = t;
+        }
+    }
+    int t = a[i + 1];
+    a[i + 1] = a[r];
+    a[r] = t;
+    return i + 1;
+}
+
+__global__ void quicksortKernel(int *a, int *l, int *r, int *nl, int *nr, int nTasks, int *next) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= nTasks) return;
+
+    int low = l[id], high = r[id];
+
+    if (high - low + 1 <= MIN_PART) {
+        insertionSort(a, low, high);
+        return;
+    }
+
+    int p = partition(a, low, high);
+
+    if (p - 1 > low) {
+        int idx = atomicAdd(next, 1);
+        nl[idx] = low;
+        nr[idx] = p - 1;
+    }
+    if (p + 1 < high) {
+        int idx = atomicAdd(next, 1);
+        nl[idx] = p + 1;
+        nr[idx] = high;
+    }
+}
+
+int main() {
+    int h_a[N] = {24, 17, 85, 13, 9, 54, 76, 45, 4, 63, 21, 33, 89, 12, 99, 1};
+    int *d_a, *l, *r, *nl, *nr, *next;
+
+    cudaMalloc(&d_a, N * sizeof(int));
+    cudaMemcpy(d_a, h_a, N * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMalloc(&l, N * sizeof(int));
+    cudaMalloc(&r, N * sizeof(int));
+    cudaMalloc(&nl, N * sizeof(int));
+    cudaMalloc(&nr, N * sizeof(int));
+    cudaMalloc(&next, sizeof(int));
+
+    int h_l[1] = {0}, h_r[1] = {N - 1};
+    cudaMemcpy(l, h_l, sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(r, h_r, sizeof(int), cudaMemcpyHostToDevice);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+
+    int nTasks = 1;
+    while (nTasks > 0) {
+        cudaMemset(next, 0, sizeof(int));
+        int blocks = (nTasks + TPB - 1) / TPB;
+        quicksortKernel<<<blocks, TPB>>>(d_a, l, r, nl, nr, nTasks, next);
+        cudaDeviceSynchronize();
+
+        cudaMemcpy(&nTasks, next, sizeof(int), cudaMemcpyDeviceToHost);
+
+        int *tmpL = l; l = nl; nl = tmpL;
+        int *tmpR = r; r = nr; nr = tmpR;
+    }
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+
+    cudaMemcpy(h_a, d_a, N * sizeof(int), cudaMemcpyDeviceToHost);
+
+    double log2n = log2((double)N);
+    printf("\nSorted Array:\n");
+    for (int i = 0; i < N; i++) printf("%d ", h_a[i]);
+
+    printf("\n\n===== COMPLEXITY ANALYSIS =====\n");
+    printf("Time Complexity : O((N log N)/P) = %.2f units\n", (N * log2n) / TPB);
+    printf("Cost Complexity : O(N log N) = %.2f units\n", N * log2n);
+    printf("Execution Time  : %.5f ms\n", ms);
+
+    cudaFree(d_a); cudaFree(l); cudaFree(r);
+    cudaFree(nl);  cudaFree(nr); cudaFree(next);
+    cudaEventDestroy(start); cudaEventDestroy(stop);
+    return 0;
+}
+
+-----------------------------------------------------------------------------------
+
+Leader Election.c
+
+#include <mpi.h>
+#include <stdio.h>
+
+int main(int argc, char** argv) {
+    int rank, size;
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int failed_process = 5;         // Simulating failure of process 5
+    int initiator = 1;               // Process 1 detects the failure
+    int next = (rank + 1) % size;
+    int prev = (rank - 1 + size) % size;
+
+    int msg, coordinator;
+
+    if (rank == initiator) {
+        printf("Process %d detected failure of coordinator process %d and initiated election.\n",
+               rank, failed_process);
+
+        msg = rank;
+        MPI_Send(&msg, 1, MPI_INT, next, 0, MPI_COMM_WORLD);
+        MPI_Recv(&msg, 1, MPI_INT, prev, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        if (msg < rank && rank != failed_process)
+            msg = rank;
+
+        coordinator = msg;
+        printf("Process %d: Coordinator elected is process %d\n", rank, coordinator);
+    } 
+    else {
+        if (rank == failed_process) {
+            // Failed process neither sends nor receives messages
+            MPI_Finalize();
+            return 0;
+        }
+
+        MPI_Recv(&msg, 1, MPI_INT, prev, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        if (rank > msg && rank != failed_process)
+            msg = rank;
+
+        MPI_Send(&msg, 1, MPI_INT, next, 0, MPI_COMM_WORLD);
+    }
+
+    if (rank != failed_process)
+        MPI_Bcast(&msg, 1, MPI_INT, initiator, MPI_COMM_WORLD);
+
+    if (rank != failed_process)
+        printf("Process %d: Coordinator is process %d\n", rank, msg);
+
+    MPI_Finalize();
+    return 0;
+} 
+--------------------------------------------------------------------------------------------------
+chatserver.c
+
+#include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char** argv) {
+  const int PING_PONG_LIMIT = 10;
+
+  MPI_Init(NULL, NULL);
+  int rank;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  int size;
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+  if (size != 2) {
+    fprintf(stderr, "World size must be two for %s\n", argv[0]);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+
+  int ping_pong_count = 0;
+  int partner_rank = (rank + 1) % 2;
+  while (ping_pong_count < PING_PONG_LIMIT) {
+    if (rank == ping_pong_count % 2) {
+      ping_pong_count++;
+      MPI_Send(&ping_pong_count, 1, MPI_INT, partner_rank, 0, MPI_COMM_WORLD);
+      printf("%d sent and incremented ping_pong_count %d to %d\n",
+             rank, ping_pong_count, partner_rank);
+    } else {
+      MPI_Recv(&ping_pong_count, 1, MPI_INT, partner_rank, 0, MPI_COMM_WORLD,
+               MPI_STATUS_IGNORE);
+      printf("%d received ping_pong_count %d from %d\n",
+             rank, ping_pong_count, partner_rank);
+    }
+  }
+  MPI_Finalize();
+}
+
+Execution :
+mpicc -o mpi filename.c
+mpirun -np 2 mpi
+
+SampleOutput:
+0 sent and incremented ping_pong_count 1 to 1
+1 received ping_pong_count 1 from 0
+1 sent and incremented ping_pong_count 2 to 0
+0 received ping_pong_count 2 from 1
+0 sent and incremented ping_pong_count 3 to 1
+0 received ping_pong_count 4 from 1
+0 sent and incremented ping_pong_count 5 to 1
+1 received ping_pong_count 3 from 0
+1 sent and incremented ping_pong_count 4 to 0
+1 received ping_pong_count 5 from 0
+1 sent and incremented ping_pong_count 6 to 0
+0 received ping_pong_count 6 from 1
+0 sent and incremented ping_pong_count 7 to 1
+1 received ping_pong_count 7 from 0
+1 sent and incremented ping_pong_count 8 to 0
+1 received ping_pong_count 9 from 0
+1 sent and incremented ping_pong_count 10 to 0
+0 received ping_pong_count 8 from 1
+0 sent and incremented ping_pong_count 9 to 1
+0 received ping_pong_count 10 from 1
+
+--------------------------------------------------------------------------------------------------
+mutual Exclusion.c
+
+#include <stdio.h>
+#include <mpi.h>
+
+int main(int argc, char **argv) {
+    int size, rank;
+    MPI_Init(&argc, &argv);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    
+    int shared = 0;
+    
+    if (rank == 0) {
+        int queue[10];
+        for (int j = 0; j < 10; j++) 
+            queue[j] = 0;
+        
+        int front = 0;
+        int rear = -1;
+        int count = 0;
+        int lock = 0;
+        int process;
+        MPI_Status st;
+        
+        while (1) {
+            MPI_Recv(&process, 1, MPI_INT, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &st);
+            
+            if (st.MPI_SOURCE == 0)
+                break;
+            
+            printf("Queue has ");
+            for (int j = front; j < 6; j++) {
+                if (queue[j] == 0)
+                    break;
+                printf("%d ", queue[j]);
+            }
+            printf("\n");
+            
+            if (st.MPI_TAG == 3) {
+                shared = process;
+                int send = queue[front++];
+                count--;
+                printf("Process %d changed value is %d\n", st.MPI_SOURCE, shared);
+                
+                if (send == 0)
+                    break;
+                
+                printf("Process %d acquired shared resource\n", send);
+                MPI_Send(&shared, 1, MPI_INT, send, 2, MPI_COMM_WORLD);
+            }
+            
+            if (st.MPI_TAG == 1) {
+                if (lock == 0 && count == 0) {
+                    lock = 1;
+                    printf("Process %d acquired shared resource\n", process);
+                    MPI_Send(&shared, 1, MPI_INT, process, 2, MPI_COMM_WORLD);
+                } else {
+                    queue[++rear] = process;
+                    count++;
+                }
+            }
+        }
+    } else {
+        MPI_Send(&rank, 1, MPI_INT, 0, 1, MPI_COMM_WORLD);
+        MPI_Status st;
+        int recv;
+        MPI_Recv(&shared, 1, MPI_INT, 0, 2, MPI_COMM_WORLD, &st);
+        
+        if (st.MPI_TAG == 2) {
+            int before = shared;
+            shared++;
+            printf("Process %d, Before altering %d; After altering %d\n", rank, before, shared);
+            MPI_Send(&shared, 1, MPI_INT, 0, 3, MPI_COMM_WORLD);
+        }
+    }
+    
+    MPI_Finalize();
+}
+
+Execution:
+>> mpicc −o mpi mutualexclusion.c // if it shows error for "For loop initial execution " then >   mpicc -std=c99 -o mpi mutualExclusion2.c
+
+>> mpirun −np 4 mpi
+Sample output:
+
+Queue has
+Process 1 acquired shared resource
+Queue has
+Queue has 3
+Process 1 changed value is 1
+Process 3 acquired shared resource
+Process 1, Before altering 0; After altering 1
+Queue has
+Process 3, Before altering 1; After altering 2
+Queue has 2
+Process 3 changed value is 2
+Process 2 acquired shared resource
+Process 2, Before altering 2; After altering 3
+Queue has
+Process 2 changed value is 3
+
+--------------------------------------------------------------------------------------------------
+Scatter and Gather.c
+
+#include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char **argv) {
+    int size, rank;
+    MPI_Init(&argc, &argv);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    int *globaldata = NULL; 
+    int localdata;
+
+    if (rank == 0) {
+
+        globaldata = malloc(size * sizeof(int));
+        for (int i = 0; i < size; i++) {
+            globaldata[i] = 2 * i + 1;
+        }
+        printf("Processor %d has initial data: ", rank);
+        for (int i = 0; i < size; i++) {
+            printf("%d ", globaldata[i]);
+        }
+        printf("\n");
+    }
+
+
+    MPI_Scatter(globaldata, 1, MPI_INT, &localdata, 1, MPI_INT, 0,
+                MPI_COMM_WORLD);
+    
+    printf("Processor %d has data %d\n", rank, localdata);
+    localdata *= 2;
+    printf("Processor %d doubling the data, now has %d\n", rank, localdata);
+
+
+    MPI_Gather(&localdata, 1, MPI_INT, globaldata, 1, MPI_INT, 0,
+               MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        printf("Processor %d has gathered data: ", rank);
+        for (int i = 0; i < size; i++) {
+            printf("%d ", globaldata[i]);
+        }
+        printf("\n");
+    }
+
+
+    if (rank == 0) {
+        free(globaldata);
+    }
+    
+    MPI_Finalize();
+    return 0;
+}
+
+Execution :
+mpicc -std=c99 -o filename.c
+mpirun -np 6 mpi
+
+SampleOutput:
+
+Processor 0 has initial data: 1 3 5 7
+Processor 0 has data 1
+Processor 0 doubling the data, now has 2
+Processor 2 has data 5
+Processor 2 doubling the data, now has 10
+Processor 3 has data 7
+Processor 3 doubling the data, now has 14
+Processor 1 has data 3
+Processor 1 doubling the data, now has 6
+Processor 0 has gathered data: 2 6 10 14
+
+--------------------------------------------------------------------------------------------------
+Berkeley.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <mpi.h>
+
+int main(int argc, char** argv) {
+    int rank, size;
+    int local_time, avg_time;
+    int *all_times = NULL;
+
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+
+    local_time = 1000 + rank * 10;  // Example: different times for each process
+    printf("Process %d local time: %d\n", rank, local_time);
+
+    if (rank == 0) {
+        all_times = (int*)malloc(size * sizeof(int));
+    }
+
+    MPI_Gather(&local_time, 1, MPI_INT, all_times, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        int sum = 0;
+        for (int i = 0; i < size; i++) {
+            sum += all_times[i];
+        }
+        avg_time = sum / size;
+
+        printf("\nAverage time: %d\n", avg_time);
+
+
+        for (int i = 0; i < size; i++) {
+            all_times[i] = avg_time - all_times[i]; // Adjustment value
+        }
+    }
+
+    // Step 5: Send each process its adjustment
+    int adjustment;
+    MPI_Scatter(all_times, 1, MPI_INT, &adjustment, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Step 6: Each process adjusts its local time
+    local_time += adjustment;
+
+    printf("Process %d adjusted time: %d\n", rank, local_time);
+
+    if (rank == 0)
+        free(all_times);
+
+    MPI_Finalize();
+    return 0;
+}
+--------------------------------------------------------------------------------------------------
+Byrantine.c
+
+#include<stdio.h>
+#include<mpi.h>
+void main(int argc,char* argv[]){
+int rank,size,i,j,r,k,count,faulty=0,majorityValue;
+MPI_Init(&argc,&argv);
+MPI_Comm_size(MPI_COMM_WORLD,&size);
+MPI_Comm_rank(MPI_COMM_WORLD,&rank);
+MPI_Status st;
+if(rank==2||rank==5)
+faulty=1;
+if(faulty==1)
+printf("i am rank %d Faulty..find me  \n",rank);
+int recv[size];
+if(faulty!=1){
+        for(i=0;i<size;i++){
+                if(i!=rank){
+                        MPI_Send(&rank,1,MPI_INT,i,101,MPI_COMM_WORLD);
+                }
+        }
+        for(i=0;i<size;i++){
+                if(i==rank)
+                        recv[i]=rank;
+                else{
+                        MPI_Recv(&recv[i],1,MPI_INT,i,101,MPI_COMM_WORLD,&st);
+                }
+        }
+}
+else if(faulty==1){
+        for(i=0;i<size;i++){
+                if(i!=rank){
+                        r=(rand()+r*r)%100;
+                        MPI_Send(&r,1,MPI_INT,i,101,MPI_COMM_WORLD);
+                }
+        }
+        for(i=0;i<size;i++){ 
+                if(i==rank)
+                        recv[i]=rank;
+                else{
+                        MPI_Recv(&recv[i],1,MPI_INT,i,101,MPI_COMM_WORLD,&st);
+                }
+        }
+        for(i=0;i<size;i++)
+			recv[i]=(rand()+r*r)%100;
+}
+
+for(i=0;i<size;i++)
+        if(i!=rank)
+                MPI_Send(recv,size,MPI_INT,i,201,MPI_COMM_WORLD);
+int vect[size][size];
+for(i=0;i<size-1;i++)
+                MPI_Recv(vect[i],size,MPI_INT,MPI_ANY_SOURCE,201,MPI_COMM_WORLD,&st);
+for(i=0;i<size;i++){
+        for(j=0;j<size-1;j++){
+                count=0;
+                majorityValue=vect[j][i];
+                for(k=0;k<size-1;k++){
+                        if(vect[k][i]==majorityValue)
+                                count++;
+                        else
+                                count--;
+                }
+                if(count>0){
+                        break;
+                }
+        }
+        if(j==size-1)
+                printf("%d says %d is Faulty\n",rank,i);
+}
+MPI_Finalize();
+}
+
+Execution:
+
+mpicc -o mpi filename.c
+mpirun -np 6 mpi
+
+sampleOutput:
+
+i am rank 2 Faulty..find me
+i am rank 5 Faulty..find me
+0 says 2 is Faulty
+0 says 5 is Faulty
+1 says 2 is Faulty
+1 says 5 is Faulty
+3 says 2 is Faulty
+3 says 5 is Faulty
+4 says 2 is Faulty
+4 says 5 is Faulty
+2 says 2 is Faulty
+2 says 5 is Faulty
+5 says 2 is Faulty
+5 says 5 is Faulty
