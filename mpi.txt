@@ -1,0 +1,453 @@
+Leader Election.c
+
+#include <mpi.h>
+#include <stdio.h>
+
+int main(int argc, char** argv) {
+    int rank, size;
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int failed_process = 5;         // Simulating failure of process 5
+    int initiator = 1;               // Process 1 detects the failure
+    int next = (rank + 1) % size;
+    int prev = (rank - 1 + size) % size;
+
+    int msg, coordinator;
+
+    if (rank == initiator) {
+        printf("Process %d detected failure of coordinator process %d and initiated election.\n",
+               rank, failed_process);
+
+        msg = rank;
+        MPI_Send(&msg, 1, MPI_INT, next, 0, MPI_COMM_WORLD);
+        MPI_Recv(&msg, 1, MPI_INT, prev, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        if (msg < rank && rank != failed_process)
+            msg = rank;
+
+        coordinator = msg;
+        printf("Process %d: Coordinator elected is process %d\n", rank, coordinator);
+    } 
+    else {
+        if (rank == failed_process) {
+            // Failed process neither sends nor receives messages
+            MPI_Finalize();
+            return 0;
+        }
+
+        MPI_Recv(&msg, 1, MPI_INT, prev, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        if (rank > msg && rank != failed_process)
+            msg = rank;
+
+        MPI_Send(&msg, 1, MPI_INT, next, 0, MPI_COMM_WORLD);
+    }
+
+    if (rank != failed_process)
+        MPI_Bcast(&msg, 1, MPI_INT, initiator, MPI_COMM_WORLD);
+
+    if (rank != failed_process)
+        printf("Process %d: Coordinator is process %d\n", rank, msg);
+
+    MPI_Finalize();
+    return 0;
+} 
+--------------------------------------------------------------------------------------------------
+chatserver.c
+
+#include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char** argv) {
+  const int PING_PONG_LIMIT = 10;
+
+  MPI_Init(NULL, NULL);
+  int rank;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  int size;
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+  if (size != 2) {
+    fprintf(stderr, "World size must be two for %s\n", argv[0]);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+
+  int ping_pong_count = 0;
+  int partner_rank = (rank + 1) % 2;
+  while (ping_pong_count < PING_PONG_LIMIT) {
+    if (rank == ping_pong_count % 2) {
+      ping_pong_count++;
+      MPI_Send(&ping_pong_count, 1, MPI_INT, partner_rank, 0, MPI_COMM_WORLD);
+      printf("%d sent and incremented ping_pong_count %d to %d\n",
+             rank, ping_pong_count, partner_rank);
+    } else {
+      MPI_Recv(&ping_pong_count, 1, MPI_INT, partner_rank, 0, MPI_COMM_WORLD,
+               MPI_STATUS_IGNORE);
+      printf("%d received ping_pong_count %d from %d\n",
+             rank, ping_pong_count, partner_rank);
+    }
+  }
+  MPI_Finalize();
+}
+
+Execution :
+mpicc -o mpi filename.c
+mpirun -np 2 mpi
+
+SampleOutput:
+0 sent and incremented ping_pong_count 1 to 1
+1 received ping_pong_count 1 from 0
+1 sent and incremented ping_pong_count 2 to 0
+0 received ping_pong_count 2 from 1
+0 sent and incremented ping_pong_count 3 to 1
+0 received ping_pong_count 4 from 1
+0 sent and incremented ping_pong_count 5 to 1
+1 received ping_pong_count 3 from 0
+1 sent and incremented ping_pong_count 4 to 0
+1 received ping_pong_count 5 from 0
+1 sent and incremented ping_pong_count 6 to 0
+0 received ping_pong_count 6 from 1
+0 sent and incremented ping_pong_count 7 to 1
+1 received ping_pong_count 7 from 0
+1 sent and incremented ping_pong_count 8 to 0
+1 received ping_pong_count 9 from 0
+1 sent and incremented ping_pong_count 10 to 0
+0 received ping_pong_count 8 from 1
+0 sent and incremented ping_pong_count 9 to 1
+0 received ping_pong_count 10 from 1
+
+--------------------------------------------------------------------------------------------------
+mutual Exclusion.c
+
+#include <stdio.h>
+#include <mpi.h>
+
+int main(int argc, char **argv) {
+    int size, rank;
+    MPI_Init(&argc, &argv);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    
+    int shared = 0;
+    
+    if (rank == 0) {
+        int queue[10];
+        for (int j = 0; j < 10; j++) 
+            queue[j] = 0;
+        
+        int front = 0;
+        int rear = -1;
+        int count = 0;
+        int lock = 0;
+        int process;
+        MPI_Status st;
+        
+        while (1) {
+            MPI_Recv(&process, 1, MPI_INT, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &st);
+            
+            if (st.MPI_SOURCE == 0)
+                break;
+            
+            printf("Queue has ");
+            for (int j = front; j < 6; j++) {
+                if (queue[j] == 0)
+                    break;
+                printf("%d ", queue[j]);
+            }
+            printf("\n");
+            
+            if (st.MPI_TAG == 3) {
+                shared = process;
+                int send = queue[front++];
+                count--;
+                printf("Process %d changed value is %d\n", st.MPI_SOURCE, shared);
+                
+                if (send == 0)
+                    break;
+                
+                printf("Process %d acquired shared resource\n", send);
+                MPI_Send(&shared, 1, MPI_INT, send, 2, MPI_COMM_WORLD);
+            }
+            
+            if (st.MPI_TAG == 1) {
+                if (lock == 0 && count == 0) {
+                    lock = 1;
+                    printf("Process %d acquired shared resource\n", process);
+                    MPI_Send(&shared, 1, MPI_INT, process, 2, MPI_COMM_WORLD);
+                } else {
+                    queue[++rear] = process;
+                    count++;
+                }
+            }
+        }
+    } else {
+        MPI_Send(&rank, 1, MPI_INT, 0, 1, MPI_COMM_WORLD);
+        MPI_Status st;
+        int recv;
+        MPI_Recv(&shared, 1, MPI_INT, 0, 2, MPI_COMM_WORLD, &st);
+        
+        if (st.MPI_TAG == 2) {
+            int before = shared;
+            shared++;
+            printf("Process %d, Before altering %d; After altering %d\n", rank, before, shared);
+            MPI_Send(&shared, 1, MPI_INT, 0, 3, MPI_COMM_WORLD);
+        }
+    }
+    
+    MPI_Finalize();
+}
+
+Execution:
+>> mpicc −o mpi mutualexclusion.c // if it shows error for "For loop initial execution " then >   mpicc -std=c99 -o mpi mutualExclusion2.c
+
+>> mpirun −np 4 mpi
+Sample output:
+
+Queue has
+Process 1 acquired shared resource
+Queue has
+Queue has 3
+Process 1 changed value is 1
+Process 3 acquired shared resource
+Process 1, Before altering 0; After altering 1
+Queue has
+Process 3, Before altering 1; After altering 2
+Queue has 2
+Process 3 changed value is 2
+Process 2 acquired shared resource
+Process 2, Before altering 2; After altering 3
+Queue has
+Process 2 changed value is 3
+
+--------------------------------------------------------------------------------------------------
+Scatter and Gather.c
+
+#include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char **argv) {
+    int size, rank;
+    MPI_Init(&argc, &argv);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    int *globaldata = NULL; 
+    int localdata;
+
+    if (rank == 0) {
+
+        globaldata = malloc(size * sizeof(int));
+        for (int i = 0; i < size; i++) {
+            globaldata[i] = 2 * i + 1;
+        }
+        printf("Processor %d has initial data: ", rank);
+        for (int i = 0; i < size; i++) {
+            printf("%d ", globaldata[i]);
+        }
+        printf("\n");
+    }
+
+
+    MPI_Scatter(globaldata, 1, MPI_INT, &localdata, 1, MPI_INT, 0,
+                MPI_COMM_WORLD);
+    
+    printf("Processor %d has data %d\n", rank, localdata);
+    localdata *= 2;
+    printf("Processor %d doubling the data, now has %d\n", rank, localdata);
+
+
+    MPI_Gather(&localdata, 1, MPI_INT, globaldata, 1, MPI_INT, 0,
+               MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        printf("Processor %d has gathered data: ", rank);
+        for (int i = 0; i < size; i++) {
+            printf("%d ", globaldata[i]);
+        }
+        printf("\n");
+    }
+
+
+    if (rank == 0) {
+        free(globaldata);
+    }
+    
+    MPI_Finalize();
+    return 0;
+}
+
+Execution :
+mpicc -std=c99 -o filename.c
+mpirun -np 6 mpi
+
+SampleOutput:
+
+Processor 0 has initial data: 1 3 5 7
+Processor 0 has data 1
+Processor 0 doubling the data, now has 2
+Processor 2 has data 5
+Processor 2 doubling the data, now has 10
+Processor 3 has data 7
+Processor 3 doubling the data, now has 14
+Processor 1 has data 3
+Processor 1 doubling the data, now has 6
+Processor 0 has gathered data: 2 6 10 14
+
+--------------------------------------------------------------------------------------------------
+Berkeley.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <mpi.h>
+
+int main(int argc, char** argv) {
+    int rank, size;
+    int local_time, avg_time;
+    int *all_times = NULL;
+
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // Step 1: Assign each process a "local time"
+    // (In real systems, this would be the system clock value)
+    local_time = 1000 + rank * 10;  // Example: different times for each process
+    printf("Process %d local time: %d\n", rank, local_time);
+
+    // Step 2: Master process (rank 0) collects all local times
+    if (rank == 0) {
+        all_times = (int*)malloc(size * sizeof(int));
+    }
+
+    // Gather all local times to the master process
+    MPI_Gather(&local_time, 1, MPI_INT, all_times, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Step 3: Master computes the average time
+    if (rank == 0) {
+        int sum = 0;
+        for (int i = 0; i < size; i++) {
+            sum += all_times[i];
+        }
+        avg_time = sum / size;
+
+        printf("\nAverage time: %d\n", avg_time);
+
+        // Step 4: Compute adjustment for each process
+        for (int i = 0; i < size; i++) {
+            all_times[i] = avg_time - all_times[i]; // Adjustment value
+        }
+    }
+
+    // Step 5: Send each process its adjustment
+    int adjustment;
+    MPI_Scatter(all_times, 1, MPI_INT, &adjustment, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Step 6: Each process adjusts its local time
+    local_time += adjustment;
+
+    printf("Process %d adjusted time: %d\n", rank, local_time);
+
+    if (rank == 0)
+        free(all_times);
+
+    MPI_Finalize();
+    return 0;
+}
+--------------------------------------------------------------------------------------------------
+Byrantine.c
+
+#include<stdio.h>
+#include<mpi.h>
+void main(int argc,char* argv[]){
+int rank,size,i,j,r,k,count,faulty=0,majorityValue;
+MPI_Init(&argc,&argv);
+MPI_Comm_size(MPI_COMM_WORLD,&size);
+MPI_Comm_rank(MPI_COMM_WORLD,&rank);
+MPI_Status st;
+if(rank==2||rank==5)
+faulty=1;
+if(faulty==1)
+printf("i am rank %d Faulty..find me  \n",rank);
+int recv[size];
+if(faulty!=1){
+        for(i=0;i<size;i++){
+                if(i!=rank){
+                        MPI_Send(&rank,1,MPI_INT,i,101,MPI_COMM_WORLD);
+                }
+        }
+        for(i=0;i<size;i++){
+                if(i==rank)
+                        recv[i]=rank;
+                else{
+                        MPI_Recv(&recv[i],1,MPI_INT,i,101,MPI_COMM_WORLD,&st);
+                }
+        }
+}
+else if(faulty==1){
+        for(i=0;i<size;i++){
+                if(i!=rank){
+                        r=(rand()+r*r)%100;
+                        MPI_Send(&r,1,MPI_INT,i,101,MPI_COMM_WORLD);
+                }
+        }
+        for(i=0;i<size;i++){ 
+                if(i==rank)
+                        recv[i]=rank;
+                else{
+                        MPI_Recv(&recv[i],1,MPI_INT,i,101,MPI_COMM_WORLD,&st);
+                }
+        }
+        for(i=0;i<size;i++)
+			recv[i]=(rand()+r*r)%100;
+}
+
+for(i=0;i<size;i++)
+        if(i!=rank)
+                MPI_Send(recv,size,MPI_INT,i,201,MPI_COMM_WORLD);
+int vect[size][size];
+for(i=0;i<size-1;i++)
+                MPI_Recv(vect[i],size,MPI_INT,MPI_ANY_SOURCE,201,MPI_COMM_WORLD,&st);
+for(i=0;i<size;i++){
+        for(j=0;j<size-1;j++){
+                count=0;
+                majorityValue=vect[j][i];
+                for(k=0;k<size-1;k++){
+                        if(vect[k][i]==majorityValue)
+                                count++;
+                        else
+                                count--;
+                }
+                if(count>0){
+                        break;
+                }
+        }
+        if(j==size-1)
+                printf("%d says %d is Faulty\n",rank,i);
+}
+MPI_Finalize();
+}
+
+Execution:
+
+mpicc -o mpi filename.c
+mpirun -np 6 mpi
+
+sampleOutput:
+
+i am rank 2 Faulty..find me
+i am rank 5 Faulty..find me
+0 says 2 is Faulty
+0 says 5 is Faulty
+1 says 2 is Faulty
+1 says 5 is Faulty
+3 says 2 is Faulty
+3 says 5 is Faulty
+4 says 2 is Faulty
+4 says 5 is Faulty
+2 says 2 is Faulty
+2 says 5 is Faulty
+5 says 2 is Faulty
+5 says 5 is Faulty
